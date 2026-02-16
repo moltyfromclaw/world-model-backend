@@ -99,13 +99,7 @@ start_pod() {
     "gpuCount": $GPU_COUNT,
     "volumeInGb": $VOLUME_SIZE,
     "containerDiskInGb": 50,
-    "minMemoryInGb": 100,
-    "minVcpuCount": 16,
-    "ports": [
-        {"port": 22, "protocol": "tcp"},
-        {"port": 8765, "protocol": "tcp"}
-    ],
-    "startSsh": true,
+    "ports": ["22/tcp", "8765/tcp"],
     "supportPublicIp": true
 }
 EOF
