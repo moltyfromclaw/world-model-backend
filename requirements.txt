@@ -1,0 +1,16 @@
+# WebSocket server
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Image processing
+pillow>=10.0.0
+
+# LingBot-World deps (also in their requirements.txt)
+torch>=2.4.0
+torchvision
+numpy
+einops
+transformers
+accelerate
+safetensors
+huggingface_hub
