@@ -36,10 +36,19 @@ usage() {
 
 graphql_query() {
     local query="$1"
-    curl -s -X POST "$API_URL" \
+    local response
+    response=$(curl -s -X POST "$API_URL" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $RUNPOD_API_KEY" \
-        -d "{\"query\": \"$query\"}"
+        -d "{\"query\": \"$query\"}")
+    
+    # Debug: show raw response if it's not valid JSON
+    if ! echo "$response" | jq . >/dev/null 2>&1; then
+        echo "API Error (raw response): $response" >&2
+        echo "{}"
+        return 1
+    fi
+    echo "$response"
 }
 
 list_pods() {
@@ -48,7 +57,9 @@ list_pods() {
 }
 
 get_pod_id() {
-    graphql_query "{ myself { pods { id name } } }" | jq -r ".data.myself.pods[] | select(.name == \"$POD_NAME\") | .id"
+    local response
+    response=$(graphql_query "{ myself { pods { id name } } }")
+    echo "$response" | jq -r ".data.myself.pods[] | select(.name == \"$POD_NAME\") | .id" 2>/dev/null || echo ""
 }
 
 start_pod() {
