@@ -1,5 +1,6 @@
 #!/bin/bash
 # RunPod control script - start/stop pods to save costs
+# Uses the new REST API (not GraphQL)
 
 set -e
 
@@ -13,7 +14,7 @@ if [ -z "$RUNPOD_API_KEY" ]; then
     exit 1
 fi
 
-API_URL="https://api.runpod.io/graphql"
+API_BASE="https://rest.runpod.io/v1"
 
 # Pod configuration
 POD_NAME="${POD_NAME:-world-model-inference}"
@@ -34,40 +35,50 @@ usage() {
     echo "  ssh      - SSH into the pod"
 }
 
-graphql_query() {
-    local query="$1"
-    local response
-    response=$(curl -s -X POST "$API_URL" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $RUNPOD_API_KEY" \
-        -d "{\"query\": \"$query\"}")
+api_call() {
+    local method="$1"
+    local endpoint="$2"
+    local data="$3"
     
-    # Debug: show raw response if it's not valid JSON
-    if ! echo "$response" | jq . >/dev/null 2>&1; then
-        echo "API Error (raw response): $response" >&2
-        echo "{}"
+    local response
+    if [ -n "$data" ]; then
+        response=$(curl -s -X "$method" "${API_BASE}${endpoint}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUNPOD_API_KEY" \
+            -d "$data")
+    else
+        response=$(curl -s -X "$method" "${API_BASE}${endpoint}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUNPOD_API_KEY")
+    fi
+    
+    # Check for errors
+    if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        echo "API Error: $(echo "$response" | jq -r '.error')" >&2
         return 1
     fi
+    
     echo "$response"
 }
 
 list_pods() {
     echo "Listing pods..."
-    graphql_query "{ myself { pods { id name runtime { uptimeInSeconds gpus { id } } } } }" | jq '.data.myself.pods'
+    api_call GET "/pods" | jq '.pods[] | {id, name, status: .desiredStatus, gpu: .machine.gpu}'
 }
 
 get_pod_id() {
-    local response
-    response=$(graphql_query "{ myself { pods { id name } } }")
-    echo "$response" | jq -r ".data.myself.pods[] | select(.name == \"$POD_NAME\") | .id" 2>/dev/null || echo ""
+    local pods
+    pods=$(api_call GET "/pods")
+    echo "$pods" | jq -r ".pods[] | select(.name == \"$POD_NAME\") | .id" 2>/dev/null || echo ""
 }
 
 start_pod() {
+    local POD_ID
     POD_ID=$(get_pod_id)
     
-    if [ -n "$POD_ID" ]; then
+    if [ -n "$POD_ID" ] && [ "$POD_ID" != "null" ]; then
         echo "Starting existing pod: $POD_ID"
-        graphql_query "mutation { podResume(input: { podId: \"$POD_ID\" }) { id } }" | jq
+        api_call POST "/pods/$POD_ID/start" | jq
     else
         echo "Creating new pod: $POD_NAME"
         echo "GPU: $GPU_COUNT x $GPU_TYPE"
@@ -78,43 +89,44 @@ start_pod() {
             exit 1
         fi
         
-        # Create pod mutation
-        MUTATION="mutation {
-            podFindAndDeployOnDemand(input: {
-                name: \\\"$POD_NAME\\\",
-                imageName: \\\"$CONTAINER_IMAGE\\\",
-                gpuTypeId: \\\"NVIDIA A100 80GB PCIe\\\",
-                gpuCount: $GPU_COUNT,
-                volumeInGb: $VOLUME_SIZE,
-                containerDiskInGb: 50,
-                minMemoryInGb: 100,
-                minVcpuCount: 16,
-                ports: \\\"22/tcp,8765/tcp\\\",
-                startSsh: true
-            }) {
-                id
-                machineId
-            }
-        }"
-        
-        graphql_query "$MUTATION" | jq
+        # Create pod
+        local payload
+        payload=$(cat <<EOF
+{
+    "name": "$POD_NAME",
+    "imageName": "$CONTAINER_IMAGE",
+    "gpuTypeId": "NVIDIA A100 80GB PCIe",
+    "gpuCount": $GPU_COUNT,
+    "volumeInGb": $VOLUME_SIZE,
+    "containerDiskInGb": 50,
+    "minMemoryInGb": 100,
+    "minVcpuCount": 16,
+    "ports": "22/tcp,8765/tcp",
+    "startSsh": true,
+    "supportPublicIp": true
+}
+EOF
+)
+        api_call POST "/pods" "$payload" | jq
     fi
 }
 
 stop_pod() {
+    local POD_ID
     POD_ID=$(get_pod_id)
-    if [ -z "$POD_ID" ]; then
+    if [ -z "$POD_ID" ] || [ "$POD_ID" == "null" ]; then
         echo "Pod not found: $POD_NAME"
         exit 1
     fi
     
     echo "Stopping pod: $POD_ID"
-    graphql_query "mutation { podStop(input: { podId: \"$POD_ID\" }) { id } }" | jq
+    api_call POST "/pods/$POD_ID/stop" | jq
 }
 
 delete_pod() {
+    local POD_ID
     POD_ID=$(get_pod_id)
-    if [ -z "$POD_ID" ]; then
+    if [ -z "$POD_ID" ] || [ "$POD_ID" == "null" ]; then
         echo "Pod not found: $POD_NAME"
         exit 1
     fi
@@ -127,51 +139,54 @@ delete_pod() {
     fi
     
     echo "Deleting pod: $POD_ID"
-    graphql_query "mutation { podTerminate(input: { podId: \"$POD_ID\" }) }" | jq
+    api_call DELETE "/pods/$POD_ID" | jq
 }
 
 get_status() {
+    local POD_ID
     POD_ID=$(get_pod_id)
-    if [ -z "$POD_ID" ]; then
+    if [ -z "$POD_ID" ] || [ "$POD_ID" == "null" ]; then
         echo "Pod not found: $POD_NAME"
         echo "Run '$0 start' to create it"
         exit 1
     fi
     
     echo "Pod Status:"
-    graphql_query "{ pod(input: { podId: \"$POD_ID\" }) { 
-        id name 
-        desiredStatus
-        runtime { 
-            uptimeInSeconds 
-            ports { ip isIpPublic publicPort privatePort type }
-            gpus { id gpuUtilPercent memoryUtilPercent }
-        }
-    }}" | jq '.data.pod'
+    api_call GET "/pods/$POD_ID" | jq '{
+        id: .id,
+        name: .name,
+        status: .desiredStatus,
+        gpu: .machine.gpu,
+        gpuCount: .machine.gpuCount,
+        publicIp: .runtime.publicIp,
+        ports: .runtime.ports
+    }'
 }
 
 ssh_pod() {
+    local POD_ID
     POD_ID=$(get_pod_id)
-    if [ -z "$POD_ID" ]; then
+    if [ -z "$POD_ID" ] || [ "$POD_ID" == "null" ]; then
         echo "Pod not found: $POD_NAME"
         exit 1
     fi
     
-    # Get SSH info
-    SSH_INFO=$(graphql_query "{ pod(input: { podId: \"$POD_ID\" }) { 
-        runtime { ports { ip publicPort privatePort type } }
-    }}")
+    # Get pod info
+    local pod_info
+    pod_info=$(api_call GET "/pods/$POD_ID")
     
-    SSH_IP=$(echo "$SSH_INFO" | jq -r '.data.pod.runtime.ports[] | select(.privatePort == 22) | .ip')
-    SSH_PORT=$(echo "$SSH_INFO" | jq -r '.data.pod.runtime.ports[] | select(.privatePort == 22) | .publicPort')
+    local SSH_IP SSH_PORT
+    SSH_IP=$(echo "$pod_info" | jq -r '.runtime.publicIp // empty')
+    SSH_PORT=$(echo "$pod_info" | jq -r '.runtime.ports[] | select(.privatePort == 22) | .publicPort // empty')
     
-    if [ -z "$SSH_IP" ] || [ "$SSH_IP" == "null" ]; then
+    if [ -z "$SSH_IP" ]; then
         echo "SSH not available. Pod may be starting..."
+        echo "Current status: $(echo "$pod_info" | jq -r '.desiredStatus')"
         exit 1
     fi
     
     echo "Connecting to: root@$SSH_IP:$SSH_PORT"
-    ssh -p "$SSH_PORT" "root@$SSH_IP"
+    ssh -o StrictHostKeyChecking=no -p "$SSH_PORT" "root@$SSH_IP"
 }
 
 case "${1:-}" in
