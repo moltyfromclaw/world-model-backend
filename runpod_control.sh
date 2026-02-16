@@ -89,7 +89,7 @@ start_pod() {
             exit 1
         fi
         
-        # Create pod
+        # Create pod - minimal required fields
         local payload
         payload=$(cat <<EOF
 {
@@ -97,10 +97,7 @@ start_pod() {
     "imageName": "$CONTAINER_IMAGE",
     "gpuTypeId": "NVIDIA A100 80GB PCIe",
     "gpuCount": $GPU_COUNT,
-    "volumeInGb": $VOLUME_SIZE,
-    "containerDiskInGb": 50,
-    "ports": ["22/tcp", "8765/tcp"],
-    "supportPublicIp": true
+    "volumeInGb": $VOLUME_SIZE
 }
 EOF
 )
