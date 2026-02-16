@@ -89,18 +89,19 @@ start_pod() {
             exit 1
         fi
         
-        # Create pod - minimal required fields
+        # Create pod - use 'image' not 'imageName' per API response sample
         local payload
         payload=$(cat <<EOF
 {
     "name": "$POD_NAME",
-    "imageName": "$CONTAINER_IMAGE",
+    "image": "$CONTAINER_IMAGE",
     "gpuTypeId": "NVIDIA A100 80GB PCIe",
     "gpuCount": $GPU_COUNT,
     "volumeInGb": $VOLUME_SIZE
 }
 EOF
 )
+        echo "Debug payload: $payload" >&2
         api_call POST "/pods" "$payload" | jq
     fi
 }
