@@ -3,6 +3,7 @@
 WebSocket server for LingBot-World frame streaming.
 
 Receives control inputs (WASD), runs inference, streams frames back.
+Also provides HTTP health endpoints for testing without WebSocket.
 """
 
 import asyncio
@@ -15,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+from http import HTTPStatus
+from aiohttp import web
 
 import websockets
 from PIL import Image
@@ -23,6 +26,15 @@ import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global state for health checks
+server_state = {
+    "started_at": None,
+    "model_loaded": False,
+    "model_dir": None,
+    "active_connections": 0,
+    "total_frames_generated": 0,
+}
 
 # Configuration
 HOST = os.getenv("WS_HOST", "0.0.0.0")
@@ -204,13 +216,124 @@ async def stream_frames(websocket, inference: WorldModelInference, controls: Con
         logger.error(f"Frame streaming error: {e}")
 
 
-async def main():
-    """Start the WebSocket server."""
-    logger.info(f"Starting WebSocket server on ws://{HOST}:{PORT}")
-    logger.info(f"Model: {MODEL_DIR}, GPUs: {NUM_GPUS}, Target FPS: {TARGET_FPS}")
+### HTTP Health Endpoints ###
+
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
+
+async def health_handler(request):
+    """Basic health check - is the server running?"""
+    return web.json_response({
+        "status": "ok",
+        "service": "world-model-backend",
+        "timestamp": time.time(),
+    })
+
+async def ready_handler(request):
+    """Readiness check - is the model loaded and ready?"""
+    ready = server_state["model_loaded"]
+    status = HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE
+    return web.json_response({
+        "ready": ready,
+        "model_dir": server_state["model_dir"],
+        "uptime_seconds": time.time() - server_state["started_at"] if server_state["started_at"] else 0,
+        "active_connections": server_state["active_connections"],
+        "total_frames_generated": server_state["total_frames_generated"],
+    }, status=status)
+
+async def test_frame_handler(request):
+    """Generate a single test frame without WebSocket - useful for testing inference."""
+    inference = WorldModelInference(MODEL_DIR, NUM_GPUS)
+    controls = ControlState()
     
+    prompt = request.query.get("prompt", "A test scene for health check")
+    
+    try:
+        await inference.initialize(prompt)
+        frame_data = await inference.generate_frame(controls)
+        inference.cleanup()
+        
+        return web.Response(
+            body=frame_data,
+            content_type="image/jpeg",
+            headers={"X-Frame-Index": "0", "X-Prompt": prompt[:50]}
+        )
+    except Exception as e:
+        return web.json_response({
+            "error": str(e),
+            "status": "inference_failed"
+        }, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+    finally:
+        inference.cleanup()
+
+async def status_handler(request):
+    """Full status with all details."""
+    # Check if model files exist
+    model_path = Path(MODEL_DIR)
+    model_exists = model_path.exists() if not MODEL_DIR.startswith("/") else Path(MODEL_DIR).exists()
+    
+    # Check GPU availability (mock for now)
+    gpu_info = "unknown"
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], 
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            gpu_info = result.stdout.strip().split("\n")
+    except:
+        gpu_info = "nvidia-smi not available"
+    
+    return web.json_response({
+        "status": "ok",
+        "service": "world-model-backend",
+        "version": "1.0.0",
+        "config": {
+            "ws_port": PORT,
+            "http_port": HTTP_PORT,
+            "model_dir": MODEL_DIR,
+            "num_gpus": NUM_GPUS,
+            "frame_size": f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+            "target_fps": TARGET_FPS,
+        },
+        "state": {
+            "started_at": server_state["started_at"],
+            "uptime_seconds": time.time() - server_state["started_at"] if server_state["started_at"] else 0,
+            "model_loaded": server_state["model_loaded"],
+            "model_exists": model_exists,
+            "active_connections": server_state["active_connections"],
+            "total_frames_generated": server_state["total_frames_generated"],
+        },
+        "gpu_info": gpu_info,
+    })
+
+def create_http_app():
+    """Create the HTTP app with health endpoints."""
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/ready", ready_handler)
+    app.router.add_get("/status", status_handler)
+    app.router.add_get("/test-frame", test_frame_handler)
+    return app
+
+
+async def main():
+    """Start both WebSocket and HTTP servers."""
+    server_state["started_at"] = time.time()
+    server_state["model_dir"] = MODEL_DIR
+    
+    logger.info(f"Starting WebSocket server on ws://{HOST}:{PORT}")
+    logger.info(f"Starting HTTP server on http://{HOST}:{HTTP_PORT}")
+    logger.info(f"Model: {MODEL_DIR}, GPUs: {NUM_GPUS}, Target FPS: {TARGET_FPS}")
+    logger.info(f"Health endpoints: /health, /ready, /status, /test-frame")
+    
+    # Start HTTP server
+    http_app = create_http_app()
+    http_runner = web.AppRunner(http_app)
+    await http_runner.setup()
+    http_site = web.TCPSite(http_runner, HOST, HTTP_PORT)
+    await http_site.start()
+    
+    # Start WebSocket server
     async with websockets.serve(handle_client, HOST, PORT):
-        logger.info("Server running. Press Ctrl+C to stop.")
+        logger.info("Servers running. Press Ctrl+C to stop.")
         await asyncio.Future()  # Run forever
 
 

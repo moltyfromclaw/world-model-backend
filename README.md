@@ -50,6 +50,25 @@ cd world-model-backend
 
 ## API
 
+### HTTP Health Endpoints (port 8080)
+
+Test the server without WebSocket:
+
+```bash
+# Basic health - is server running?
+curl http://localhost:8080/health
+
+# Readiness - is model loaded?
+curl http://localhost:8080/ready
+
+# Full status with GPU info
+curl http://localhost:8080/status
+
+# Generate a test frame (returns JPEG)
+curl http://localhost:8080/test-frame -o test.jpg
+curl "http://localhost:8080/test-frame?prompt=A%20forest" -o forest.jpg
+```
+
 ### WebSocket Messages
 
 **Client → Server:**
