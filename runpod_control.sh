@@ -63,13 +63,13 @@ api_call() {
 
 list_pods() {
     echo "Listing pods..."
-    api_call GET "/pods" | jq '.pods[] | {id, name, status: .desiredStatus, gpu: .machine.gpu}'
+    api_call GET "/pods" | jq '.[] | {id, name, status: .desiredStatus, gpu: .machine.gpu}'
 }
 
 get_pod_id() {
     local pods
     pods=$(api_call GET "/pods")
-    echo "$pods" | jq -r ".pods[] | select(.name == \"$POD_NAME\") | .id" 2>/dev/null || echo ""
+    echo "$pods" | jq -r ".[] | select(.name == \"$POD_NAME\") | .id" 2>/dev/null || echo ""
 }
 
 start_pod() {
@@ -101,7 +101,10 @@ start_pod() {
     "containerDiskInGb": 50,
     "minMemoryInGb": 100,
     "minVcpuCount": 16,
-    "ports": "22/tcp,8765/tcp",
+    "ports": [
+        {"port": 22, "protocol": "tcp"},
+        {"port": 8765, "protocol": "tcp"}
+    ],
     "startSsh": true,
     "supportPublicIp": true
 }
