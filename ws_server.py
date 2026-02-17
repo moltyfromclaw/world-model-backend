@@ -2,8 +2,8 @@
 """
 WebSocket server for LingBot-World frame streaming.
 
-Receives control inputs (WASD), runs inference, streams frames back.
-Also provides HTTP health endpoints for testing without WebSocket.
+Uses subprocess to call generate.py (which handles distributed setup correctly),
+then streams the output video frames to clients.
 """
 
 import asyncio
@@ -16,6 +16,7 @@ import tempfile
 import time
 import threading
 import queue
+import glob
 from pathlib import Path
 from typing import Optional, List
 from http import HTTPStatus
@@ -25,7 +26,6 @@ from concurrent.futures import ThreadPoolExecutor
 import websockets
 from PIL import Image
 import io
-import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,16 +43,16 @@ server_state = {
 HOST = os.getenv("WS_HOST", "0.0.0.0")
 PORT = int(os.getenv("WS_PORT", "8765"))
 MODEL_DIR = os.getenv("MODEL_DIR", "/workspace/lingbot-world-base-cam")
-FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "1280"))
-FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "720"))
+LINGBOT_DIR = os.getenv("LINGBOT_DIR", "/workspace/lingbot-world")
+FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "832"))  # Use smaller size for faster generation
+FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
 TARGET_FPS = int(os.getenv("TARGET_FPS", "16"))
-NUM_GPUS = int(os.getenv("NUM_GPUS", "8"))
 FRAMES_PER_BATCH = int(os.getenv("FRAMES_PER_BATCH", "17"))  # Frames to generate at once
 
-# Thread pool for blocking inference
-executor = ThreadPoolExecutor(max_workers=2)
+# Thread pool for blocking operations
+executor = ThreadPoolExecutor(max_workers=4)
 
-# Control state
+
 class ControlState:
     def __init__(self):
         self.w = False
@@ -64,130 +64,124 @@ class ControlState:
     def update(self, key: str, action: str):
         if hasattr(self, key):
             setattr(self, key, action == "down")
-            
-    def to_action_string(self) -> str:
-        """Convert controls to action string for model."""
-        actions = []
-        if self.w: actions.append("forward")
-        if self.s: actions.append("backward")
-        if self.a: actions.append("left")
-        if self.d: actions.append("right")
-        return ",".join(actions) if actions else "none"
 
 
 class WorldModelInference:
-    """Wrapper for LingBot-World inference using the actual model."""
+    """Wrapper for LingBot-World inference using subprocess."""
     
-    def __init__(self, model_dir: str, num_gpus: int = 8):
-        self.model_dir = model_dir
-        self.num_gpus = num_gpus
+    def __init__(self):
         self.initialized = False
-        self.wan_pipeline = None
-        self.current_image = None
         self.prompt = ""
-        self.frame_buffer: queue.Queue = queue.Queue(maxsize=100)
+        self.current_image_path = None
+        self.frame_buffer: queue.Queue = queue.Queue(maxsize=200)
         self.generating = False
         self.generation_thread = None
+        self.output_dir = tempfile.mkdtemp(prefix="lingbot_frames_")
+        self.batch_count = 0
         
-    def _load_model(self):
-        """Load the WanI2V model (blocking, run in thread)."""
-        import torch
-        import torch.distributed as dist
-        
-        # Add lingbot-world to path
-        lingbot_path = "/workspace/lingbot-world"
-        if lingbot_path not in sys.path:
-            sys.path.insert(0, lingbot_path)
-        
-        import wan
-        from wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
-        
-        logger.info("Loading WanI2V model...")
-        
-        rank = int(os.getenv("RANK", 0))
-        world_size = int(os.getenv("WORLD_SIZE", 1))
-        local_rank = int(os.getenv("LOCAL_RANK", 0))
-        
-        cfg = WAN_CONFIGS["i2v-A14B"]
-        
-        self.wan_pipeline = wan.WanI2V(
-            config=cfg,
-            checkpoint_dir=self.model_dir,
-            device_id=local_rank,
-            rank=rank,
-            t5_fsdp=(world_size > 1),
-            dit_fsdp=(world_size > 1),
-            use_sp=(self.num_gpus > 1),
-            t5_cpu=False,
-        )
-        
-        self.cfg = cfg
-        self.max_area = MAX_AREA_CONFIGS[f"{FRAME_WIDTH}*{FRAME_HEIGHT}"]
-        
-        logger.info("Model loaded successfully!")
-        server_state["model_loaded"] = True
-        
-    def _generate_batch(self, prompt: str, image: Image.Image, frame_num: int = 17) -> List[Image.Image]:
-        """Generate a batch of frames (blocking, run in thread)."""
-        import torch
-        from wan.utils.utils import save_video
-        
-        logger.info(f"Generating {frame_num} frames...")
-        
-        video_tensor = self.wan_pipeline.generate(
-            prompt,
-            image,
-            max_area=self.max_area,
-            frame_num=frame_num,
-            shift=self.cfg.sample_shift,
-            sample_solver='unipc',
-            sampling_steps=self.cfg.sample_steps,
-            guide_scale=self.cfg.sample_guide_scale,
-            seed=int(time.time()) % 10000,
-            offload_model=False,
-        )
-        
-        # Convert tensor to list of PIL images
-        # video_tensor shape: [frames, channels, height, width]
+    def _extract_frames_from_video(self, video_path: str) -> List[Image.Image]:
+        """Extract frames from generated video using ffmpeg."""
         frames = []
-        video_np = video_tensor.cpu().numpy()
+        frame_dir = os.path.join(self.output_dir, f"batch_{self.batch_count}")
+        os.makedirs(frame_dir, exist_ok=True)
         
-        # Normalize from [-1, 1] to [0, 255]
-        video_np = ((video_np + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
-        
-        for i in range(video_np.shape[0]):
-            frame = video_np[i].transpose(1, 2, 0)  # CHW -> HWC
-            frames.append(Image.fromarray(frame))
+        try:
+            # Use ffmpeg to extract frames
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vf", f"fps={TARGET_FPS}",
+                os.path.join(frame_dir, "frame_%04d.jpg")
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
-        logger.info(f"Generated {len(frames)} frames")
+            if result.returncode != 0:
+                logger.error(f"ffmpeg error: {result.stderr}")
+                return frames
+            
+            # Load extracted frames
+            frame_files = sorted(glob.glob(os.path.join(frame_dir, "frame_*.jpg")))
+            for frame_file in frame_files:
+                try:
+                    img = Image.open(frame_file)
+                    frames.append(img.copy())
+                    img.close()
+                except Exception as e:
+                    logger.error(f"Error loading frame {frame_file}: {e}")
+                    
+            logger.info(f"Extracted {len(frames)} frames from video")
+            
+        except subprocess.TimeoutExpired:
+            logger.error("ffmpeg timed out")
+        except Exception as e:
+            logger.error(f"Error extracting frames: {e}")
+            
         return frames
         
+    def _generate_video_batch(self) -> Optional[str]:
+        """Generate a video using generate.py subprocess."""
+        self.batch_count += 1
+        output_file = os.path.join(self.output_dir, f"output_{self.batch_count}.mp4")
+        
+        # Determine image to use
+        image_path = self.current_image_path or os.path.join(LINGBOT_DIR, "examples/02/image.jpg")
+        
+        cmd = [
+            "python", "generate.py",
+            "--task", "i2v-A14B",
+            "--size", f"{FRAME_WIDTH}*{FRAME_HEIGHT}",
+            "--ckpt_dir", MODEL_DIR,
+            "--image", image_path,
+            "--frame_num", str(FRAMES_PER_BATCH),
+            "--offload_model", "True",
+            "--prompt", self.prompt,
+            "--save_file", output_file,
+        ]
+        
+        logger.info(f"Running generate.py: {' '.join(cmd[:10])}...")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=LINGBOT_DIR,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"generate.py failed: {result.stderr[-500:]}")
+                return None
+                
+            if os.path.exists(output_file):
+                logger.info(f"Generated video: {output_file}")
+                server_state["model_loaded"] = True
+                return output_file
+            else:
+                # Check for default output filename pattern
+                pattern = os.path.join(LINGBOT_DIR, "i2v-A14B_*.mp4")
+                matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+                if matches:
+                    latest = matches[0]
+                    logger.info(f"Found generated video: {latest}")
+                    return latest
+                    
+                logger.error("No output video found")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            logger.error("generate.py timed out after 5 minutes")
+            return None
+        except Exception as e:
+            logger.error(f"Error running generate.py: {e}")
+            return None
+    
     async def initialize(self, prompt: str, image_path: Optional[str] = None):
-        """Initialize the world with a prompt and optional starting image."""
+        """Initialize the world with a prompt."""
         logger.info(f"Initializing world with prompt: {prompt[:50]}...")
         
         self.prompt = prompt
-        
-        # Load starting image
-        if image_path and os.path.exists(image_path):
-            self.current_image = Image.open(image_path).convert("RGB")
-        else:
-            # Use default example image
-            default_image = "/workspace/lingbot-world/examples/02/image.jpg"
-            if os.path.exists(default_image):
-                self.current_image = Image.open(default_image).convert("RGB")
-            else:
-                # Create a placeholder image
-                self.current_image = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT), (50, 50, 80))
-        
-        # Resize to target dimensions
-        self.current_image = self.current_image.resize((FRAME_WIDTH, FRAME_HEIGHT), Image.LANCZOS)
-        
-        # Load model if not loaded
-        if not server_state["model_loaded"]:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(executor, self._load_model)
-        
+        self.current_image_path = image_path
         self.initialized = True
         
         # Start background generation
@@ -198,48 +192,57 @@ class WorldModelInference:
         return True
     
     def _generation_loop(self):
-        """Background thread that continuously generates frames."""
-        import torch
-        
+        """Background thread that continuously generates video batches."""
         while self.generating:
             try:
-                # Generate a batch of frames
-                frames = self._generate_batch(
-                    self.prompt,
-                    self.current_image,
-                    frame_num=FRAMES_PER_BATCH
-                )
+                # Generate a video
+                video_path = self._generate_video_batch()
                 
-                # Add frames to buffer
-                for frame in frames:
-                    if not self.generating:
-                        break
-                    try:
-                        self.frame_buffer.put(frame, timeout=1.0)
-                    except queue.Full:
-                        # Drop oldest frame if buffer full
+                if video_path:
+                    # Extract frames
+                    frames = self._extract_frames_from_video(video_path)
+                    
+                    # Add frames to buffer
+                    for frame in frames:
+                        if not self.generating:
+                            break
                         try:
-                            self.frame_buffer.get_nowait()
-                            self.frame_buffer.put(frame)
-                        except:
-                            pass
-                
-                # Use last frame as input for next batch (for continuity)
-                if frames:
-                    self.current_image = frames[-1]
+                            self.frame_buffer.put(frame, timeout=1.0)
+                        except queue.Full:
+                            # Drop oldest frame if buffer full
+                            try:
+                                old = self.frame_buffer.get_nowait()
+                                old.close()
+                                self.frame_buffer.put(frame)
+                            except:
+                                pass
+                    
+                    # Save last frame as starting point for next batch
+                    if frames:
+                        last_frame_path = os.path.join(self.output_dir, "last_frame.jpg")
+                        frames[-1].save(last_frame_path, "JPEG", quality=95)
+                        self.current_image_path = last_frame_path
+                        
+                    # Clean up video file
+                    try:
+                        os.remove(video_path)
+                    except:
+                        pass
+                else:
+                    # Generation failed, wait before retry
+                    time.sleep(5)
                     
             except Exception as e:
-                logger.error(f"Generation error: {e}")
+                logger.error(f"Generation loop error: {e}")
                 import traceback
                 traceback.print_exc()
-                time.sleep(1)  # Back off on error
+                time.sleep(5)
         
     async def get_next_frame(self) -> bytes:
         """Get the next frame from the buffer."""
         loop = asyncio.get_event_loop()
         
         try:
-            # Try to get frame from buffer
             frame = await asyncio.wait_for(
                 loop.run_in_executor(executor, lambda: self.frame_buffer.get(timeout=2.0)),
                 timeout=3.0
@@ -248,11 +251,11 @@ class WorldModelInference:
             # Encode as JPEG
             buffer = io.BytesIO()
             frame.save(buffer, format='JPEG', quality=85)
+            frame.close()
             server_state["total_frames_generated"] += 1
             return buffer.getvalue()
             
         except (asyncio.TimeoutError, queue.Empty):
-            # Buffer empty, return placeholder
             return self._create_loading_frame()
     
     def _create_loading_frame(self) -> bytes:
@@ -263,15 +266,17 @@ class WorldModelInference:
         draw = ImageDraw.Draw(img)
         
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-            small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+            small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         except:
             font = ImageFont.load_default()
             small_font = font
         
-        draw.text((FRAME_WIDTH//2 - 150, FRAME_HEIGHT//2 - 40), "Generating...", fill=(255, 255, 255), font=font)
-        draw.text((FRAME_WIDTH//2 - 200, FRAME_HEIGHT//2 + 20), f"Prompt: {self.prompt[:40]}...", fill=(180, 180, 180), font=small_font)
-        draw.text((FRAME_WIDTH//2 - 150, FRAME_HEIGHT//2 + 60), f"Buffer: {self.frame_buffer.qsize()} frames", fill=(150, 150, 150), font=small_font)
+        # Center text
+        cx, cy = FRAME_WIDTH // 2, FRAME_HEIGHT // 2
+        draw.text((cx - 100, cy - 30), "Generating...", fill=(255, 255, 255), font=font)
+        draw.text((cx - 150, cy + 10), f"Batch #{self.batch_count}", fill=(180, 180, 180), font=small_font)
+        draw.text((cx - 150, cy + 35), f"Buffer: {self.frame_buffer.qsize()} frames", fill=(150, 150, 150), font=small_font)
         
         buffer = io.BytesIO()
         img.save(buffer, format='JPEG', quality=85)
@@ -285,9 +290,16 @@ class WorldModelInference:
         # Clear buffer
         while not self.frame_buffer.empty():
             try:
-                self.frame_buffer.get_nowait()
+                frame = self.frame_buffer.get_nowait()
+                frame.close()
             except:
                 break
+        # Clean up temp directory
+        import shutil
+        try:
+            shutil.rmtree(self.output_dir)
+        except:
+            pass
 
 
 async def handle_client(websocket):
@@ -296,7 +308,7 @@ async def handle_client(websocket):
     server_state["active_connections"] += 1
     
     controls = ControlState()
-    inference = WorldModelInference(MODEL_DIR, NUM_GPUS)
+    inference = WorldModelInference()
     frame_interval = 1.0 / TARGET_FPS
     streaming_task = None
     
@@ -340,13 +352,9 @@ async def stream_frames(websocket, inference: WorldModelInference, controls: Con
         while True:
             start_time = time.time()
             
-            # Get next frame from buffer
             frame_data = await inference.get_next_frame()
-            
-            # Send as binary
             await websocket.send(frame_data)
             
-            # Maintain target FPS
             elapsed = time.time() - start_time
             sleep_time = max(0, interval - elapsed)
             await asyncio.sleep(sleep_time)
@@ -357,8 +365,6 @@ async def stream_frames(websocket, inference: WorldModelInference, controls: Con
         logger.info("Frame streaming cancelled")
     except Exception as e:
         logger.error(f"Frame streaming error: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 ### HTTP Health Endpoints ###
@@ -366,7 +372,6 @@ async def stream_frames(websocket, inference: WorldModelInference, controls: Con
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
 
 async def health_handler(request):
-    """Basic health check - is the server running?"""
     return web.json_response({
         "status": "ok",
         "service": "world-model-backend",
@@ -374,7 +379,6 @@ async def health_handler(request):
     })
 
 async def ready_handler(request):
-    """Readiness check - is the model loaded and ready?"""
     ready = server_state["model_loaded"]
     status = HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE
     return web.json_response({
@@ -386,12 +390,9 @@ async def ready_handler(request):
     }, status=status)
 
 async def status_handler(request):
-    """Full status with all details."""
-    # Check if model files exist
     model_path = Path(MODEL_DIR)
     model_exists = model_path.exists()
     
-    # Check GPU availability
     gpu_info = "unknown"
     try:
         result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], 
@@ -404,12 +405,12 @@ async def status_handler(request):
     return web.json_response({
         "status": "ok",
         "service": "world-model-backend",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "config": {
             "ws_port": PORT,
             "http_port": HTTP_PORT,
             "model_dir": MODEL_DIR,
-            "num_gpus": NUM_GPUS,
+            "lingbot_dir": LINGBOT_DIR,
             "frame_size": f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
             "target_fps": TARGET_FPS,
             "frames_per_batch": FRAMES_PER_BATCH,
@@ -425,66 +426,34 @@ async def status_handler(request):
         "gpu_info": gpu_info,
     })
 
-async def test_frame_handler(request):
-    """Generate a single test frame - loads model if needed."""
-    inference = WorldModelInference(MODEL_DIR, NUM_GPUS)
-    
-    prompt = request.query.get("prompt", "A test scene")
-    
-    try:
-        await inference.initialize(prompt)
-        
-        # Wait for first frame
-        frame_data = await inference.get_next_frame()
-        inference.cleanup()
-        
-        return web.Response(
-            body=frame_data,
-            content_type="image/jpeg",
-            headers={"X-Prompt": prompt[:50]}
-        )
-    except Exception as e:
-        logger.error(f"Test frame error: {e}")
-        import traceback
-        traceback.print_exc()
-        return web.json_response({
-            "error": str(e),
-            "status": "inference_failed"
-        }, status=HTTPStatus.INTERNAL_SERVER_ERROR)
-    finally:
-        inference.cleanup()
-
 def create_http_app():
-    """Create the HTTP app with health endpoints."""
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ready", ready_handler)
     app.router.add_get("/status", status_handler)
-    app.router.add_get("/test-frame", test_frame_handler)
     return app
 
 
 async def main():
-    """Start both WebSocket and HTTP servers."""
     server_state["started_at"] = time.time()
     server_state["model_dir"] = MODEL_DIR
     
     logger.info(f"Starting WebSocket server on ws://{HOST}:{PORT}")
     logger.info(f"Starting HTTP server on http://{HOST}:{HTTP_PORT}")
-    logger.info(f"Model: {MODEL_DIR}, GPUs: {NUM_GPUS}, Target FPS: {TARGET_FPS}")
-    logger.info(f"Health endpoints: /health, /ready, /status, /test-frame")
+    logger.info(f"Model: {MODEL_DIR}")
+    logger.info(f"LingBot dir: {LINGBOT_DIR}")
+    logger.info(f"Frame size: {FRAME_WIDTH}x{FRAME_HEIGHT} @ {TARGET_FPS}fps")
+    logger.info(f"Frames per batch: {FRAMES_PER_BATCH}")
     
-    # Start HTTP server
     http_app = create_http_app()
     http_runner = web.AppRunner(http_app)
     await http_runner.setup()
     http_site = web.TCPSite(http_runner, HOST, HTTP_PORT)
     await http_site.start()
     
-    # Start WebSocket server
     async with websockets.serve(handle_client, HOST, PORT):
         logger.info("Servers running. Press Ctrl+C to stop.")
-        await asyncio.Future()  # Run forever
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
