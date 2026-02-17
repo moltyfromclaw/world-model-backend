@@ -81,6 +81,16 @@ if [ -d "$MODEL_DIR" ] && [ ! -d "/workspace/lingbot-world/lingbot-world-base-ca
     ln -sf $MODEL_DIR /workspace/lingbot-world/lingbot-world-base-cam
 fi
 
+# Pull latest world-model-backend code
+cd /workspace
+if [ -d "world-model-backend" ]; then
+    cd world-model-backend
+    git pull || true
+    cd ..
+else
+    git clone https://github.com/moltyfromclaw/world-model-backend.git
+fi
+
 echo ""
 echo "=== Setup Complete ==="
 echo "Finished: $(date)"
@@ -89,5 +99,6 @@ echo "Quick test (single GPU):"
 echo "  cd /workspace/lingbot-world"
 echo "  python generate.py --task i2v-A14B --size 832*480 --ckpt_dir lingbot-world-base-cam --image examples/02/image.jpg --frame_num 17 --offload_model True --prompt 'A forest scene'"
 echo ""
-echo "Multi-GPU (8x):"
-echo "  torchrun --nproc_per_node=8 generate.py --task i2v-A14B --size 1280*720 --ckpt_dir lingbot-world-base-cam --image examples/02/image.jpg --dit_fsdp --t5_fsdp --ulysses_size 8 --frame_num 17 --prompt 'A forest scene'"
+echo "Starting WebSocket server..."
+cd /workspace/world-model-backend
+exec python ws_server.py
