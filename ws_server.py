@@ -130,19 +130,40 @@ class WorldModelInference:
             logger.error(f"Input image not found: {image_path}")
             return False
             
-        # Build command - exactly like the working CLI command
-        cmd = [
-            sys.executable,  # Use same Python interpreter
-            "generate.py",
-            "--task", "i2v-A14B",
-            "--size", FRAME_SIZE,
-            "--ckpt_dir", MODEL_DIR,
-            "--image", image_path,
-            "--frame_num", str(FRAMES_PER_BATCH),
-            "--offload_model", "True",
-            "--prompt", self.prompt,
-            "--save_file", output_path,
-        ]
+        # Use multi-GPU mode with torchrun for faster inference
+        num_gpus = int(os.getenv("NUM_GPUS", "8"))
+        
+        if num_gpus > 1:
+            # Multi-GPU: use torchrun with FSDP
+            cmd = [
+                "torchrun",
+                f"--nproc_per_node={num_gpus}",
+                "generate.py",
+                "--task", "i2v-A14B",
+                "--size", FRAME_SIZE,
+                "--ckpt_dir", MODEL_DIR,
+                "--image", image_path,
+                "--frame_num", str(FRAMES_PER_BATCH),
+                "--dit_fsdp",
+                "--t5_fsdp",
+                f"--ulysses_size", str(num_gpus),
+                "--prompt", self.prompt,
+                "--save_file", output_path,
+            ]
+        else:
+            # Single GPU: use offload mode
+            cmd = [
+                sys.executable,
+                "generate.py",
+                "--task", "i2v-A14B",
+                "--size", FRAME_SIZE,
+                "--ckpt_dir", MODEL_DIR,
+                "--image", image_path,
+                "--frame_num", str(FRAMES_PER_BATCH),
+                "--offload_model", "True",
+                "--prompt", self.prompt,
+                "--save_file", output_path,
+            ]
         
         logger.info(f"Running generate.py (batch #{self.batch_count})...")
         logger.debug(f"Command: {' '.join(cmd)}")
