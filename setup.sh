@@ -19,7 +19,7 @@ if [ "$COMPUTE_CAP" -ge "120" ]; then
 fi
 
 # Install system deps
-apt-get update && apt-get install -y git curl wget jq htop tmux
+apt-get update && apt-get install -y git curl wget jq htop tmux ffmpeg
 
 # Handle PyTorch for Blackwell GPUs
 if [ "$NEEDS_NIGHTLY" = true ]; then
