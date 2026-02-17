@@ -25,6 +25,7 @@ from aiohttp import web
 from concurrent.futures import ThreadPoolExecutor
 
 import websockets
+from websockets.server import serve
 from PIL import Image
 import io
 
@@ -582,8 +583,18 @@ async def main():
     await http_site.start()
     logger.info(f"HTTP server: http://{HOST}:{HTTP_PORT}")
     
-    # Start WebSocket server
-    async with websockets.serve(handle_client, HOST, WS_PORT):
+    # Start WebSocket server with permissive settings for proxied connections
+    async with websockets.serve(
+        handle_client, 
+        HOST, 
+        WS_PORT,
+        # Allow connections from any origin (for RunPod proxy)
+        origins=None,
+        # Increase timeouts for slow connections
+        ping_interval=30,
+        ping_timeout=30,
+        close_timeout=10,
+    ):
         logger.info(f"WebSocket server: ws://{HOST}:{WS_PORT}")
         logger.info("Ready for connections!")
         await asyncio.Future()
